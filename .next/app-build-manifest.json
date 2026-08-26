@@ -1,0 +1,9 @@
+{
+  "pages": {
+    "/api/ping/route": [
+      "static/chunks/webpack.js",
+      "static/chunks/main-app.js",
+      "static/chunks/app/api/ping/route.js"
+    ]
+  }
+}
