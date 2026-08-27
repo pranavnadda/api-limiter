@@ -8,4 +8,6 @@
 export { MemoryStore } from "./memory-store";
 export { RateLimiter } from "./limiter";
 export { endpointConfig, defaultConfig } from "./config";
+export { MetricsCollector, metrics } from "./metrics";
 export type { RateLimitConfig, RateLimitResult, RateLimitStore } from "./types";
+export type { MetricsSnapshot, EndpointStats } from "./metrics";

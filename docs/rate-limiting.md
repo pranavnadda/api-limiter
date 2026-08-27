@@ -149,7 +149,24 @@ curl -i http://localhost:3000/api/ping
      REDIS_TOKEN=your-upstash-token
    ```
 
-## Project Structure
+## Phase 1: Metrics Implementation (Completed 2026-08-27)
+
+### What Was Added
+- `src/lib/rate-limit/metrics.ts`: Metrics collector tracking total, allowed, blocked, active IPs (with TTL cleanup), requests/sec (rolling 60s window), per-endpoint stats, and recent requests.
+- `src/app/api/metrics/route.ts`: Endpoint exposing live metrics; includes POST reset for testing.
+- Updated middleware: Records metrics for every allowed/blocked request with IP and endpoint tracking.
+- Moved `middleware.ts` to project root (Next.js requires this).
+
+### Why This Design
+- Separate metrics class (not embedded in middleware) = clean separation, easy testing, future Redis metrics upgrade.
+- TTL on IP tracking (5 min) + rolling window (1 min) = no memory leaks.
+- Metrics endpoint = dashboard can poll in real-time.
+
+### Verification
+- `GET /api/metrics` returns `{total, allowed, blocked, activeIPs, requestsPerSecond, endpoints, recentRequests}`
+- Metrics start at zero, increment correctly after requests, show blocked requests after rate limit hits.
+
+## Phase 2 (Next): Dashboard UI
 
 - `src/lib/rate-limit/` — Rate limiting core
   - `types.ts` — Interfaces and types
