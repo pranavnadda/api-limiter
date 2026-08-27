@@ -101,14 +101,249 @@ All the logic stays the same; only the storage layer changes.
 
 ---
 
-## Next Steps / Ideas for Further Exploration
+## Phase 1 Changes (August 27, 2026)
 
-- Add a **sliding window** or **token bucket** algorithm for smoother limiting.
-- Build a tiny **dashboard** that shows current counts per endpoint/IP.
-- Write automated tests (Jest + supertest) that assert the limiter behaves correctly under concurrency.
-- Integrate with a real email service (e.g., Resend, SendGrid) for the contact route.
-- Add API‑key authentication alongside rate limiting for truly private endpoints.
-- Create a visual example (using the `dataviz` skill) that shows how request counts fill and drain over time.
+### What Was Added
+We added **metrics and observability** so you can see the rate limiter working in real time:
+
+| New File | What It Does |
+|----------|--------------|
+| `src/lib/rate-limit/metrics.ts` | **MetricsCollector** class — tracks total requests, allowed, blocked, active IPs (with 5-min TTL cleanup), requests/second (rolling 60s window), per-endpoint stats, and recent requests list. |
+| `src/app/api/metrics/route.ts` | **GET /api/metrics** endpoint — returns JSON with all stats. Dashboard polls this. Also supports **POST /api/metrics** to reset for testing. |
+| `src/middleware.ts` | Moved from project root to `src/` (Next.js requirement). Updated to call `metrics.recordRequest()` on every allowed/blocked request. Records IP, endpoint, status code, remaining tokens. |
+
+### Design Decisions in Phase 1
+
+1. **Separate metrics class** — Not embedded in middleware. Why?
+   - Cleaner: middleware stays focused on rate limiting
+   - Testable: mock the metrics collector easily
+   - Upgradable: swap to Redis-backed metrics later without touching middleware
+
+2. **TTL on IP tracking** — Active IPs expire after 5 minutes
+   - Prevents memory leak from tracking forever-inactive visitors
+
+3. **Rolling 60-second window** — Requests/second calculated over last 60 seconds
+   - Shows current traffic intensity, not just total since server start
+
+4. **Recent requests limited to 50** — Dashboard table doesn't grow infinitely
+
+---
+
+## Phase 2 Changes (August 27, 2026)
+
+### What Was Added
+We built a **live dashboard UI** to visualize rate limiting in real time:
+
+| New File | What It Does |
+|----------|--------------|
+| `src/app/page.tsx` (replaced) | **Dashboard component** — client-side React component with live metrics visualization. Polls `/api/metrics` every 2 seconds. Shows: stat cards (total/allowed/blocked/IPs), requests/sec chart (line chart), per-endpoint breakdown table, blocked-vs-allowed bar chart, recent requests table (last 50), and testing instructions. |
+
+### Design Decisions in Phase 2
+
+1. **Client-side component (`use client`)** — Why?
+   - Enables `useEffect` hook for polling metrics
+   - Allows real-time state updates without server round-trips
+   - Better UX: instant visual feedback
+
+2. **Poll every 2 seconds** — Why not faster?
+   - 2 seconds balances real-time feel with server load
+   - Slower polling (10s) feels laggy; faster (500ms) wastes resources
+   - Metrics endpoint is lightweight; server handles it easily
+
+3. **Fail-open strategy** — If metrics endpoint unreachable:
+   - Shows error message instead of crashing
+   - User knows to check if dev server is running
+   - Better than blank screen or error boundary fallback
+
+4. **Recharts for charts** — Why?
+   - Standard React charting library
+   - Works seamlessly with Next.js 15
+   - Small bundle, good performance
+   - Built-in responsiveness
+
+5. **Three visualization types**:
+   - **Stat cards** — at-a-glance metrics (color-coded for quick scanning)
+   - **Line chart** — requests/sec over time (spot traffic spikes)
+   - **Bar chart** — blocked vs allowed per endpoint (identify abused endpoints)
+   - **Tables** — detailed breakdown and recent requests (debug troubleshooting)
+
+6. **WHY comments on every function/section** — Code explains not just *what* it does but *why* that design choice:
+   - `StatCard` component reuses pattern (DRY)
+   - `useEffect` polling with cleanup prevents memory leaks
+   - Chart data slides window to last 30 points (prevents infinite growth)
+   - Transforms metrics JSON into chart-friendly format
+
+---
+
+## Step-by-Step: How to Run and Test (Complete Guide)
+
+### For Developers (Technical)
+
+#### 1. Start the Server
+```bash
+cd API-limiter
+npm install          # If first time
+npm run dev          # Starts at localhost:3000 (or 3002/3003 if busy)
+```
+
+#### 2. Test Rate Limiting Works
+```bash
+# Test 1: Basic ping
+curl http://localhost:3000/api/ping
+
+# Test 2: Check rate limit headers
+curl -i http://localhost:3000/api/ping
+
+# Test 3: Hit the limit (11th request should fail)
+for i in {1..11}; do curl -s http://localhost:3000/api/ping; done
+
+# Test 4: Different IPs = separate counters
+curl -H "x-forwarded-for: 1.2.3.4" http://localhost:3000/api/ping
+curl -H "x-forwarded-for: 5.6.7.8" http://localhost:3000/api/ping
+```
+
+#### 3. Test Metrics (Phase 1)
+```bash
+# Check metrics (should be empty at start)
+curl http://localhost:3000/api/metrics
+
+# Make some requests
+curl -s http://localhost:3000/api/ping > /dev/null
+curl -s http://localhost:3000/api/ping > /dev/null
+
+# Check metrics updated
+curl http://localhost:3000/api/metrics | grep -E '"total"|"allowed"|"blocked"'
+
+# Reset metrics for fresh test
+curl -X POST http://localhost:3000/api/metrics
+```
+
+---
+
+### For Non-Technical Users / Interview Demos
+
+#### Prerequisite
+You need a terminal (Command Prompt, PowerShell, or Terminal app).
+
+#### The Demo Script
+**Step 1: Start the app**
+```bash
+# In terminal, navigate to the project folder
+cd [path-to]/API-limiter
+
+# Start the server
+npm run dev
+
+# Keep this terminal open, it runs the web server
+```
+
+**Step 2: Show it works (open a SECOND terminal)**
+```bash
+# Make a request
+curl http://localhost:3000/api/ping
+```
+→ You see: `{"success":true,"data":{"message":"pong"...}}`
+
+**Step 3: Show rate limiting (THE COOL PART)**
+```bash
+# Make 11 requests fast
+for i in {1..11}; do echo "Request $i:"; curl http://localhost:3000/api/ping; done
+```
+→ First 10 show: `{"success":true,...}`
+→ The 11th shows: `{"success":false,"error":{"code":"RATE_LIMITED",...}}`
+
+**Say to interviewer**: "Watch—the first 10 requests go through, but the 11th gets blocked. That's the rate limiter in action."
+
+**Step 4: Show the metrics**
+```bash
+# Check live stats
+curl http://localhost:3000/api/metrics
+```
+→ Shows: `"total":11,"allowed":10,"blocked":1,"activeIPs":1`
+
+**Say**: "And here's the proof—10 allowed, 1 blocked, all tracked in real time."
+
+**That's it!** You've demonstrated:
+- ✅ Building a working API
+- ✅ Implementing rate limiting algorithm
+- ✅ Adding observability/metrics
+- ✅ Clean code with good documentation
+
+---
+
+## Complete File Structure
+
+```
+API-limiter/
+├── src/
+│   ├── app/
+│   │   ├── api/
+│   │   │   ├── ping/route.ts       # GET endpoint (10/min)
+│   │   │   ├── echo/route.ts       # POST endpoint (5/min)
+│   │   │   ├── contact/route.ts    # POST endpoint (3/10min)
+│   │   │   └── metrics/route.ts    # GET stats, POST reset
+│   │   ├── layout.tsx
+│   │   └── page.tsx                # Homepage with instructions
+│   └── lib/
+│       ├── api-response.ts         # ok(), fail() helpers
+│       ├── api-errors.ts           # tooManyRequests() etc
+│       ├── utils.ts                # validateEmail()
+│       └── rate-limit/
+│           ├── types.ts            # Interfaces
+│           ├── memory-store.ts     # In-memory counter
+│           ├── limiter.ts          # Core algorithm
+│           ├── config.ts           # Per-endpoint limits
+│           ├── metrics.ts          # NEW: Stats collector
+│           └── index.ts            # Exports
+├── middleware.ts                   # Moved to root (Next.js requirement)
+├── docs/
+│   └── rate-limiting.md            # Technical docs
+├── api limiter docs.txt            # Complete user guide (this file)
+├── Project-explainer.md            # This file
+├── package.json
+├── tsconfig.json
+└── next.config.js
+```
+
+---
+
+## Git Commit
+
+```bash
+git add src/middleware.ts src/app/page.tsx src/lib/rate-limit/metrics.ts src/app/api/metrics/route.ts docs/rate-limiting.md
+git commit -m "feat: add live dashboard UI with charts and metrics visualization
+
+Phase 2 - dashboard for real-time rate limiter observability:
+- Recharts for line/bar charts (requests/sec, blocked vs allowed)
+- Stat cards: total/allowed/blocked/IPs/blocked%/req/sec
+- Per-endpoint breakdown table + recent requests table
+- Polls /api/metrics every 2s, fail-open on endpoint error
+- WHY comments on every function explaining design decisions
+- Updated all docs: Project-explainer.md, api limiter docs.txt"
+```
+
+---
+
+## Errors Encountered & Fixed (2026-08-27)
+
+We hit and solved several issues building this project. Full history is in `errors.md` (new file). Quick summary:
+
+- **Middleware at wrong location** (`middleware.ts` at root instead of `src/`). Fixed: moved to `src/middleware.ts`.
+- **Old server still running on port 3005** (PID 6424). Fixed: kill old process, restart fresh.
+- **Metrics always zero** — caused by middleware not running / old server instance. Fixed by fixing both above.
+- **`grep` dependency accidentally added** — removed with `npm uninstall grep`.
+- **Dashboard not updating** — old server serving old `page.tsx`. Fixed by restart.
+
+**Approach behind fixes:** We document every error with root cause + fix + WHY. The `errors.md` file preserves this for future maintainers. All fixes verified with `curl -i` to confirm 429 + headers + metrics.
+
+---
+
+## What's Next (Roadmap)
+
+- **Phase 2**: Dashboard UI with live charts (Recharts)
+- **Phase 3**: Simulator page — click "Send 100 requests" and watch them become 429
+- **Phase 4**: Redis upgrade for distributed rate limiting
+- **Phase 5**: Unit tests
 
 ---
 

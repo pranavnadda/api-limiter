@@ -166,7 +166,23 @@ curl -i http://localhost:3000/api/ping
 - `GET /api/metrics` returns `{total, allowed, blocked, activeIPs, requestsPerSecond, endpoints, recentRequests}`
 - Metrics start at zero, increment correctly after requests, show blocked requests after rate limit hits.
 
-## Phase 2 (Next): Dashboard UI
+## Phase 2: Dashboard UI (Completed 2026-08-27)
+
+### What Was Added
+- `src/app/page.tsx` (replaced): Live dashboard with stats cards, line chart (requests/sec), bar chart (blocked vs allowed per endpoint), per-endpoint table, recent requests table.
+- Uses Recharts for visualization, polls `/api/metrics` every 2 seconds.
+- Fail-open: shows error message if metrics endpoint unreachable.
+
+### Why This Design
+- Client-side component (`use client`) enables useEffect for polling.
+- 2-second poll interval balances real-time feel with server load.
+- Recharts: standard React library, works with Next.js 15.
+- Three chart types cover different observability needs (at-a-glance, trends, comparisons).
+- WHY comments on every function/section.
+
+---
+
+## Phase 3 (Next): Live Simulator
 
 - `src/lib/rate-limit/` — Rate limiting core
   - `types.ts` — Interfaces and types
