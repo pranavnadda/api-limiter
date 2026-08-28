@@ -94,3 +94,7 @@ Every error we hit, from start to finish, with the root cause, fix, and design r
 ---
 
 *Created: 2026-08-27 — as part of Phase 2 dashboard build and error logging.*
+
+---
+
+## 8. `grep` accidentally included in dependencies (build/clean-up fix)

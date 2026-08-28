@@ -86,8 +86,10 @@ export default function Dashboard() {
       try {
         const res = await fetch('/api/metrics');
         if (!res.ok) throw new Error(`Status ${res.status}`);
-        const data = await res.json();
-        setMetrics(data.data);
+        const payload = await res.json();
+        const data = payload?.data ?? payload; // Handle both {data: ...} and direct response
+        if (!data) throw new Error('Empty metrics response');
+        setMetrics(data);
         setError(null);
         setLoading(false);
 
@@ -95,7 +97,7 @@ export default function Dashboard() {
         // Older points drop off so the chart doesn't grow infinitely.
         setChartData((prev) => {
           const time = new Date().toLocaleTimeString();
-          const newData = [...prev, { time, rps: data.data.requestsPerSecond }];
+          const newData = [...prev, { time, rps: data.requestsPerSecond ?? 0 }];
           return newData.slice(-30);
         });
       } catch (err) {

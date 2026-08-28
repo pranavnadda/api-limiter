@@ -22,6 +22,7 @@ export interface RateLimitRequestContext {
   url: string;
   method: string;
   headers: Headers;
+  ip?: string; // Pre-extracted IP from middleware (avoids re-extraction + allows fallback)
 }
 
 export class RateLimiter {
@@ -46,7 +47,7 @@ export class RateLimiter {
     config: RateLimitConfig,
     keyPrefix?: string
   ): Promise<RateLimitResult> {
-    const ip = this.extractIP(req.headers);
+    const ip = req.ip || this.extractIP(req.headers);
     const endpoint = keyPrefix || req.url.split("?")[0].split("/").pop() || "default";
     const key = `${endpoint}:${ip}`;
 

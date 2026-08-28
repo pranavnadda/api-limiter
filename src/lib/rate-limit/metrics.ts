@@ -148,10 +148,13 @@ export class MetricsCollector {
    */
   private calculateRequestsPerSecond(now: number): number {
     const windowStart = now - this.HISTORY_WINDOW;
-    const recentCount = this.requestHistory.filter(
-      (r) => r.timestamp >= windowStart
-    ).length;
-    return parseFloat((recentCount / (this.HISTORY_WINDOW / 1000)).toFixed(2));
+    // Filter to recent records within rolling 1-minute window
+    const recent = this.requestHistory.filter((r) => r.timestamp >= windowStart);
+    // Divide by actual elapsed time within the window (not fixed 60s),
+    // but cap denominator so very sparse windows don't inflate rate.
+    const elapsedMs = Math.min(this.HISTORY_WINDOW, now - (recent[0]?.timestamp ?? now));
+    const elapsedSec = Math.max(1, elapsedMs / 1000); // minimum 1 sec to avoid division by zero / huge spikes
+    return parseFloat((recent.length / elapsedSec).toFixed(2));
   }
 
   /**

@@ -17,7 +17,6 @@ import { MemoryStore } from "@/lib/rate-limit/memory-store";
 import { RateLimiter } from "@/lib/rate-limit/limiter";
 import { endpointConfig, defaultConfig } from "@/lib/rate-limit/config";
 import { tooManyRequests } from "@/lib/api-errors";
-import { metrics } from "@/lib/rate-limit/metrics";
 
 // Singleton store — persists across requests within the same process
 const store = new MemoryStore();
@@ -42,6 +41,29 @@ function getEndpointKey(req: NextRequest): string | null {
   return segments[0] || null;
 }
 
+/**
+ * Extract the client IP from request headers with proper fallback chain.
+ * WHY: x-forwarded-for is set by trusted proxies (Vercel, Cloudflare, nginx).
+ * x-real-ip is a common alternative header. NextRequest.ip is provided when
+ * the server knows the remote address (Vercel deployment, some Node setups).
+ * Without these, all clients look identical and per-IP isolation breaks locally.
+ */
+function extractClientIP(req: NextRequest): string {
+  const forwarded = req.headers.get("x-forwarded-for");
+  if (forwarded) {
+    return forwarded.split(",")[0]?.trim() || "unknown";
+  }
+  const realIp = req.headers.get("x-real-ip");
+  if (realIp) {
+    return realIp.trim();
+  }
+  // NextRequest.ip is available in Vercel/edge runtime; falls back to undefined locally.
+  if (req.ip) {
+    return req.ip;
+  }
+  return "unknown";
+}
+
 export async function middleware(req: NextRequest) {
   const endpoint = getEndpointKey(req);
   if (!endpoint) {
@@ -50,6 +72,9 @@ export async function middleware(req: NextRequest) {
 
   // Select config: endpoint-specific or default
   const config = endpointConfig[endpoint] || defaultConfig;
+
+  // Extract IP early so it's available for both the limiter and metrics
+  const ip = extractClientIP(req);
 
   // Run periodic cleanup
   const now = Date.now();
@@ -64,6 +89,7 @@ export async function middleware(req: NextRequest) {
         url: req.nextUrl.pathname,
         method: req.method,
         headers: req.headers,
+        ip,
       },
       config,
       endpoint
@@ -75,9 +101,6 @@ export async function middleware(req: NextRequest) {
     headers.set("X-RateLimit-Remaining", String(result.remaining));
     headers.set("X-RateLimit-Reset", String(result.resetTime));
 
-    // Extract IP for metrics tracking
-    const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
-
     if (!result.success) {
       // Rate limit exceeded — respond with 429
       headers.set("Retry-After", String(Math.ceil((result.resetTime - now) / 1000)));
@@ -87,8 +110,9 @@ export async function middleware(req: NextRequest) {
         Math.ceil((result.resetTime - now) / 1000)
       );
 
-      // Record blocked request in metrics
-      metrics.recordRequest(endpoint, false, ip, 429, 0);
+      // Metrics recording removed from middleware (Edge Runtime).
+      // Metrics must be recorded in Node.js runtime (API routes) to share
+      // the same singleton instance with /api/metrics.
 
       // Return a structured JSON response with the error
       return new Response(
@@ -107,8 +131,9 @@ export async function middleware(req: NextRequest) {
       );
     }
 
-    // Record allowed request in metrics
-    metrics.recordRequest(endpoint, true, ip, 200, result.remaining);
+    // Metrics recording removed from middleware (Edge Runtime).
+    // Metrics must be recorded in Node.js runtime (API routes) to share
+    // the same singleton instance with /api/metrics.
 
     return NextResponse.next({
       request: {
