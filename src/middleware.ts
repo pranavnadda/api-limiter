@@ -17,9 +17,17 @@ import { MemoryStore } from "@/lib/rate-limit/memory-store";
 import { RateLimiter } from "@/lib/rate-limit/limiter";
 import { endpointConfig, defaultConfig } from "@/lib/rate-limit/config";
 import { tooManyRequests } from "@/lib/api-errors";
+import { metrics } from "@/lib/rate-limit/metrics";
 
-// Singleton store — persists across requests within the same process
-const store = new MemoryStore();
+// Singleton store — persists across requests within the same process.
+// WHY globalThis: survives dev hot-reloads so counters aren't reset on edit.
+declare global {
+  // eslint-disable-next-line no-var
+  var __rateLimitStore: MemoryStore | undefined;
+}
+const store =
+  globalThis.__rateLimitStore ??
+  (globalThis.__rateLimitStore = new MemoryStore());
 const limiter = new RateLimiter(store);
 
 // Periodic cleanup of expired entries (every 5 minutes)
@@ -44,9 +52,8 @@ function getEndpointKey(req: NextRequest): string | null {
 /**
  * Extract the client IP from request headers with proper fallback chain.
  * WHY: x-forwarded-for is set by trusted proxies (Vercel, Cloudflare, nginx).
- * x-real-ip is a common alternative header. NextRequest.ip is provided when
- * the server knows the remote address (Vercel deployment, some Node setups).
- * Without these, all clients look identical and per-IP isolation breaks locally.
+ * x-real-ip is a common alternative header. Without these, all clients
+ * look identical and per-IP isolation breaks locally.
  */
 function extractClientIP(req: NextRequest): string {
   const forwarded = req.headers.get("x-forwarded-for");
@@ -56,10 +63,6 @@ function extractClientIP(req: NextRequest): string {
   const realIp = req.headers.get("x-real-ip");
   if (realIp) {
     return realIp.trim();
-  }
-  // NextRequest.ip is available in Vercel/edge runtime; falls back to undefined locally.
-  if (req.ip) {
-    return req.ip;
   }
   return "unknown";
 }
@@ -95,24 +98,30 @@ export async function middleware(req: NextRequest) {
       endpoint
     );
 
-    // Build response with rate limit headers
-    const headers = new Headers(req.headers);
-    headers.set("X-RateLimit-Limit", String(result.limit));
-    headers.set("X-RateLimit-Remaining", String(result.remaining));
-    headers.set("X-RateLimit-Reset", String(result.resetTime));
+    // Rate limit headers applied to the RESPONSE (what the client sees).
+    // WHY: These must be set on the outgoing response, not on the forwarded
+    // request headers. NextResponse.next({ request: { headers } }) only
+    // rewrites the request sent downstream, so the client would never see them.
+    const rateLimitHeaders: Record<string, string> = {
+      "X-RateLimit-Limit": String(result.limit),
+      "X-RateLimit-Remaining": String(result.remaining),
+      "X-RateLimit-Reset": String(result.resetTime),
+    };
 
     if (!result.success) {
       // Rate limit exceeded — respond with 429
-      headers.set("Retry-After", String(Math.ceil((result.resetTime - now) / 1000)));
+      const retryAfter = Math.ceil((result.resetTime - now) / 1000);
+
+      // Record the blocked request in metrics.
+      // WHY: This is the single source of truth for the dashboard.
+      // Doing it in middleware (not the route) means blocked requests
+      // are counted even though the route handler never runs.
+      metrics.recordRequest(endpoint, false, ip, 429, 0);
 
       const err = tooManyRequests(
-        `Rate limit exceeded. Try again in ${Math.ceil((result.resetTime - now) / 1000)}s.`,
-        Math.ceil((result.resetTime - now) / 1000)
+        `Rate limit exceeded. Try again in ${retryAfter}s.`,
+        retryAfter
       );
-
-      // Metrics recording removed from middleware (Edge Runtime).
-      // Metrics must be recorded in Node.js runtime (API routes) to share
-      // the same singleton instance with /api/metrics.
 
       // Return a structured JSON response with the error
       return new Response(
@@ -121,25 +130,29 @@ export async function middleware(req: NextRequest) {
           error: {
             code: "RATE_LIMITED",
             message: err.message,
-            retryAfter: Math.ceil((result.resetTime - now) / 1000),
+            retryAfter,
           },
         }),
         {
           status: 429,
-          headers,
+          headers: {
+            "Content-Type": "application/json",
+            ...rateLimitHeaders,
+            "Retry-After": String(retryAfter),
+          },
         }
       );
     }
 
-    // Metrics recording removed from middleware (Edge Runtime).
-    // Metrics must be recorded in Node.js runtime (API routes) to share
-    // the same singleton instance with /api/metrics.
+    // Record the allowed request in metrics.
+    // WHY: See comment above. This runs after the limit check passes.
+    metrics.recordRequest(endpoint, true, ip, 200, result.remaining);
 
-    return NextResponse.next({
-      request: {
-        headers,
-      },
-    });
+    const res = NextResponse.next();
+    for (const [name, value] of Object.entries(rateLimitHeaders)) {
+      res.headers.set(name, value);
+    }
+    return res;
   } catch (err) {
     // Fail-open: if the limiter crashes, let the request through
     // WHY: Better to serve a few extra requests than break the app
@@ -150,4 +163,9 @@ export async function middleware(req: NextRequest) {
 
 export const config = {
   matcher: ["/api/:path*"],
+  // WHY: Node.js runtime (not Edge) so the middleware shares the same
+  // in-memory MemoryStore and metrics collector singletons as the Node
+  // route handlers (e.g. /api/metrics). Requires experimental.nodeMiddleware
+  // in next.config.js.
+  runtime: "nodejs",
 };

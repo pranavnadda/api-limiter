@@ -1,5 +1,7 @@
 # Project Explainer: API Rate Limiter
 
+> For a concise architecture + tech-stack overview (with a diagram and the "what I used and why" table), see [`PROJECT-OVERVIEW.md`](PROJECT-OVERVIEW.md).
+
 ## What This Project Is (in Simple Terms)
 
 Imagine you have a public mailbox where anyone can drop a letter (like a contact form on a website). Without any rules, someone could spam the mailbox with thousands of letters, making it impossible for you to find the real messages. This project builds a smart "letter counter" for your website's contact form and other public endpoints. It counts how many requests (letters) each visitor sends in a given time and politely tells them to slow down if they're sending too many—like a courteous receptionist who says, "Please wait a moment before sending another letter."
@@ -18,6 +20,8 @@ In technical language: **we built a rate limiter** that protects your website fr
 ---
 
 ## How We Built It (the Pieces and Why)
+
+> **Phase 3 update (2026-08-28):** After building the dashboard, a senior-level audit was performed. It found one critical broken feature (metrics never recorded in middleware), one critical security gap (IP header spoofable), and four high-priority issues (zero tests, unprotected reset endpoint, hardcoded metrics, dirty .gitignore). All were fixed in a single pass. See [`errors.md`](errors.md) Phase 3 section for the full audit log.
 
 | File / Folder | What It Is | Why We Made It / Design Reason |
 |---------------|------------|--------------------------------|

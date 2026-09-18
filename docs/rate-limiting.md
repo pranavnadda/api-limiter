@@ -24,6 +24,7 @@ Every response includes:
 **1. x-forwarded-for Trust**
 - Only trust this header if your server is behind a proxy (Vercel, Cloudflare, etc.)
 - For raw self-hosted servers, consider using `req.ip` (Next.js 14+) or require API keys
+- See [`security-IP-spoof.md`](./security-IP-spoof.md) for the full design note (added in Phase 3 audit, 2026-08-28)
 
 **2. Memory Leak Prevention**
 - Expired entries are lazily cleaned during increment()

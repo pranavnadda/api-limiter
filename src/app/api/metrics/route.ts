@@ -20,17 +20,25 @@ export async function GET() {
 }
 
 /**
- * POST /api/metrics — Reset all metrics (for testing)
+ * POST /api/metrics — Reset all metrics (for testing only)
  *
- * WHY: Allows you to start fresh when demonstrating the dashboard.
- * In production, you'd protect this with auth or remove it.
+ * WHY: Allows starting fresh for demos. PROTECTED: requires
+ * X-Admin-Reset secret so it cannot be wiped by random clients.
  */
-export async function POST() {
+export async function POST(req: Request) {
+  const adminKey = req.headers.get("x-admin-reset");
+  // Use a simple env-backed secret; falls back to a demo value for portfolio.
+  // WHY warn: makes it obvious in real deploys that the insecure demo default
+  // is in effect and ADMIN_RESET_KEY should be set.
+  if (!process.env.ADMIN_RESET_KEY) {
+    console.warn(
+      "[metrics] ADMIN_RESET_KEY is not set; using insecure demo default 'demo-reset-key'."
+    );
+  }
+  const expected = process.env.ADMIN_RESET_KEY || "demo-reset-key";
+  if (adminKey !== expected) {
+    return fail("UNAUTHORIZED", "Invalid or missing X-Admin-Reset header", 401);
+  }
   metrics.reset();
   return ok({ message: "Metrics reset to zero" });
 }
-
-/**
- * GET /api/metrics — Aliased as GET with query params
- * GET /api/metrics?clear=true — Resets metrics (convenience)
- */

@@ -192,5 +192,16 @@ export class MetricsCollector {
   }
 }
 
-// Singleton instance shared across middleware and metrics endpoint
-export const metrics = new MetricsCollector();
+// Singleton instance shared across middleware and metrics endpoint.
+// WHY globalThis: In dev, Next.js hot-reloads modules, which would otherwise
+// create a fresh MetricsCollector on every edit and lose counts. Pinning the
+// instance to globalThis guarantees one shared collector per process (and per
+// runtime), so the middleware and the /api/metrics route see the same data.
+declare global {
+  // eslint-disable-next-line no-var
+  var __rateLimitMetrics: MetricsCollector | undefined;
+}
+
+export const metrics =
+  globalThis.__rateLimitMetrics ??
+  (globalThis.__rateLimitMetrics = new MetricsCollector());
