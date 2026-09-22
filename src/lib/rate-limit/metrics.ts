@@ -1,13 +1,5 @@
 /**
- * Metrics Collector — Observability for Rate Limiter
- *
- * WHY: You can't improve what you can't measure. This tracks every request
- * (allowed and blocked) so the dashboard can show what's happening in real-time.
- *
- * DESIGN DECISION: Separate class instead of embedding in middleware
- * - Keeps middleware focused on rate limiting logic
- * - Makes testing easier (mock the collector)
- * - Allows swapping in Redis-backed metrics later without touching middleware
+ * Metrics Collector — observability, SSE subscribers, audit log, Prometheus.
  */
 
 export interface EndpointStats {
@@ -16,10 +8,19 @@ export interface EndpointStats {
   blocked: number;
 }
 
+export interface AuditEntry {
+  timestamp: number;
+  identity: string;
+  endpoint: string;
+  retryAfter: number;
+  reason: "rate_limit" | "ban" | "blocklist";
+}
+
 export interface MetricsSnapshot {
   total: number;
   allowed: number;
   blocked: number;
+  banned: number;
   activeIPs: number;
   requestsPerSecond: number;
   endpoints: Record<string, EndpointStats>;
@@ -30,6 +31,7 @@ export interface MetricsSnapshot {
     status: number;
     remaining: number;
   }>;
+  auditLog: AuditEntry[];
 }
 
 interface RequestRecord {
@@ -38,75 +40,59 @@ interface RequestRecord {
   allowed: boolean;
 }
 
-/**
- * IP tracking with TTL (time-to-live).
- * WHY: We need to know "how many unique visitors in the last N minutes"
- * without keeping stale IPs forever (memory leak).
- */
 interface IPEntry {
   ip: string;
   lastSeen: number;
 }
 
+type Subscriber = (snapshot: MetricsSnapshot) => void;
+
 export class MetricsCollector {
   private totalRequests = 0;
   private allowedRequests = 0;
   private blockedRequests = 0;
+  private bannedRequests = 0;
   private endpointStats = new Map<string, EndpointStats>();
   private activeIPsSet = new Map<string, IPEntry>();
   private requestHistory: RequestRecord[] = [];
   private recentRequests: MetricsSnapshot["recentRequests"] = [];
+  private auditLog: AuditEntry[] = [];
+  private subscribers = new Set<Subscriber>();
 
-  // Configuration
-  private readonly IP_TTL = 300_000; // 5 minutes
-  private readonly HISTORY_WINDOW = 60_000; // 1 minute for req/s calculation
-  private readonly MAX_RECENT_REQUESTS = 50; // Keep last 50 for display
+  private readonly IP_TTL = 300_000;
+  private readonly HISTORY_WINDOW = 60_000;
+  private readonly MAX_RECENT_REQUESTS = 50;
+  private readonly MAX_AUDIT = 100;
 
-  /**
-   * Record a request passing through the rate limiter.
-   *
-   * WHY: Called by middleware on EVERY request, before and after rate check.
-   * This is the single source of truth for what happened.
-   */
   recordRequest(
     endpoint: string,
     allowed: boolean,
     ip: string,
     status: number,
-    remaining: number
+    remaining: number,
+    extra?: { retryAfter?: number; reason?: AuditEntry["reason"] }
   ): void {
     const now = Date.now();
 
-    // Update counters
     this.totalRequests++;
-    if (allowed) {
-      this.allowedRequests++;
-    } else {
-      this.blockedRequests++;
-    }
+    if (allowed) this.allowedRequests++;
+    else this.blockedRequests++;
+    if (extra?.reason === "ban") this.bannedRequests++;
 
-    // Update per-endpoint stats
     if (!this.endpointStats.has(endpoint)) {
       this.endpointStats.set(endpoint, { total: 0, allowed: 0, blocked: 0 });
     }
     const stats = this.endpointStats.get(endpoint)!;
     stats.total++;
-    if (allowed) {
-      stats.allowed++;
-    } else {
-      stats.blocked++;
-    }
+    if (allowed) stats.allowed++;
+    else stats.blocked++;
 
-    // Track active IP
     this.activeIPsSet.set(ip, { ip, lastSeen: now });
-
-    // Record for req/s calculation
     this.requestHistory.push({ timestamp: now, endpoint, allowed });
 
-    // Track recent requests for dashboard table
     this.recentRequests.unshift({
       timestamp: now,
-      ip: ip.substring(0, 12) + "...", // Truncate for privacy
+      ip: ip.length > 14 ? `${ip.slice(0, 12)}…` : ip,
       endpoint,
       status,
       remaining,
@@ -115,88 +101,119 @@ export class MetricsCollector {
       this.recentRequests.pop();
     }
 
-    // Cleanup old data (prevent memory leaks)
+    if (!allowed) {
+      this.auditLog.unshift({
+        timestamp: now,
+        identity: ip.length > 14 ? `${ip.slice(0, 12)}…` : ip,
+        endpoint,
+        retryAfter: extra?.retryAfter ?? 0,
+        reason: extra?.reason ?? "rate_limit",
+      });
+      if (this.auditLog.length > this.MAX_AUDIT) this.auditLog.pop();
+    }
+
     this.cleanupStaleData(now);
+    this.emit();
   }
 
-  /**
-   * Get current metrics snapshot.
-   *
-   * WHY: The /api/metrics endpoint calls this to return JSON.
-   * Dashboard polls that endpoint every few seconds.
-   */
   getSnapshot(): MetricsSnapshot {
     const now = Date.now();
     this.cleanupStaleData(now);
-
     return {
       total: this.totalRequests,
       allowed: this.allowedRequests,
       blocked: this.blockedRequests,
+      banned: this.bannedRequests,
       activeIPs: this.activeIPsSet.size,
       requestsPerSecond: this.calculateRequestsPerSecond(now),
       endpoints: Object.fromEntries(this.endpointStats),
       recentRequests: this.recentRequests,
+      auditLog: this.auditLog,
     };
   }
 
-  /**
-   * Calculate requests per second over the last minute.
-   *
-   * WHY: Shows current traffic intensity. Uses a rolling window
-   * to smooth out spikes.
-   */
+  subscribe(fn: Subscriber): () => void {
+    this.subscribers.add(fn);
+    fn(this.getSnapshot());
+    return () => {
+      this.subscribers.delete(fn);
+    };
+  }
+
+  toPrometheus(): string {
+    const snap = this.getSnapshot();
+    const lines: string[] = [
+      "# HELP rate_limit_requests_total Requests seen by the limiter",
+      "# TYPE rate_limit_requests_total counter",
+      `rate_limit_requests_total{result="allowed"} ${snap.allowed}`,
+      `rate_limit_requests_total{result="blocked"} ${snap.blocked}`,
+      `rate_limit_requests_total{result="banned"} ${snap.banned}`,
+      "# HELP rate_limit_requests_per_endpoint_total Requests by endpoint",
+      "# TYPE rate_limit_requests_per_endpoint_total counter",
+    ];
+    for (const [name, stats] of Object.entries(snap.endpoints)) {
+      const ep = sanitizeLabel(name);
+      lines.push(
+        `rate_limit_requests_per_endpoint_total{endpoint="${ep}",result="allowed"} ${stats.allowed}`
+      );
+      lines.push(
+        `rate_limit_requests_per_endpoint_total{endpoint="${ep}",result="blocked"} ${stats.blocked}`
+      );
+    }
+    lines.push("# EOF");
+    return lines.join("\n") + "\n";
+  }
+
+  reset(): void {
+    this.totalRequests = 0;
+    this.allowedRequests = 0;
+    this.blockedRequests = 0;
+    this.bannedRequests = 0;
+    this.endpointStats.clear();
+    this.activeIPsSet.clear();
+    this.requestHistory = [];
+    this.recentRequests = [];
+    this.auditLog = [];
+    this.emit();
+  }
+
+  private emit(): void {
+    const snap = this.getSnapshot();
+    for (const fn of this.subscribers) {
+      try {
+        fn(snap);
+      } catch (err) {
+        console.error("[metrics] subscriber error", err);
+      }
+    }
+  }
+
   private calculateRequestsPerSecond(now: number): number {
     const windowStart = now - this.HISTORY_WINDOW;
-    // Filter to recent records within rolling 1-minute window
     const recent = this.requestHistory.filter((r) => r.timestamp >= windowStart);
-    // Divide by actual elapsed time within the window (not fixed 60s),
-    // but cap denominator so very sparse windows don't inflate rate.
-    const elapsedMs = Math.min(this.HISTORY_WINDOW, now - (recent[0]?.timestamp ?? now));
-    const elapsedSec = Math.max(1, elapsedMs / 1000); // minimum 1 sec to avoid division by zero / huge spikes
+    const elapsedMs = Math.min(
+      this.HISTORY_WINDOW,
+      now - (recent[0]?.timestamp ?? now)
+    );
+    const elapsedSec = Math.max(1, elapsedMs / 1000);
     return parseFloat((recent.length / elapsedSec).toFixed(2));
   }
 
-  /**
-   * Remove stale IPs and old request records.
-   *
-   * WHY: Without this, the Set and array grow forever (memory leak).
-   * We only care about recent activity.
-   */
   private cleanupStaleData(now: number): void {
-    // Remove IPs not seen in IP_TTL
     for (const [ip, entry] of this.activeIPsSet.entries()) {
-      if (now - entry.lastSeen > this.IP_TTL) {
-        this.activeIPsSet.delete(ip);
-      }
+      if (now - entry.lastSeen > this.IP_TTL) this.activeIPsSet.delete(ip);
     }
-
-    // Remove request records older than HISTORY_WINDOW
     const windowStart = now - this.HISTORY_WINDOW;
     this.requestHistory = this.requestHistory.filter(
       (r) => r.timestamp >= windowStart
     );
   }
-
-  /**
-   * Reset all metrics (useful for testing or manual reset).
-   */
-  reset(): void {
-    this.totalRequests = 0;
-    this.allowedRequests = 0;
-    this.blockedRequests = 0;
-    this.endpointStats.clear();
-    this.activeIPsSet.clear();
-    this.requestHistory = [];
-    this.recentRequests = [];
-  }
 }
 
-// Singleton instance shared across middleware and metrics endpoint.
-// WHY globalThis: In dev, Next.js hot-reloads modules, which would otherwise
-// create a fresh MetricsCollector on every edit and lose counts. Pinning the
-// instance to globalThis guarantees one shared collector per process (and per
-// runtime), so the middleware and the /api/metrics route see the same data.
+function sanitizeLabel(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_:-]/g, "_");
+}
+
 declare global {
   // eslint-disable-next-line no-var
   var __rateLimitMetrics: MetricsCollector | undefined;

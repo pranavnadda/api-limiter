@@ -1,13 +1,21 @@
 /**
  * Rate Limit Public API — Module Exports
- *
- * WHY: A single entry point makes it easy for consumers to import
- * everything they need without deep file knowledge.
  */
 
 export { MemoryStore } from "./memory-store";
 export { RateLimiter } from "./limiter";
 export { endpointConfig, defaultConfig } from "./config";
+export { configStore } from "./config-store";
+export { banStore } from "./ban-store";
 export { MetricsCollector, metrics } from "./metrics";
-export type { RateLimitConfig, RateLimitResult, RateLimitStore } from "./types";
-export type { MetricsSnapshot, EndpointStats } from "./metrics";
+export { tryCreateRedisStore } from "./redis-store";
+export { compareAlgorithms } from "./compare";
+export { extractClientIP, extractApiKey, identityKey } from "./identity";
+export type {
+  RateLimitConfig,
+  RateLimitResult,
+  RateLimitStore,
+  RateLimitAlgorithm,
+  ConsumeResult,
+} from "./types";
+export type { MetricsSnapshot, EndpointStats, AuditEntry } from "./metrics";
