@@ -1,11 +1,17 @@
 /**
  * Metrics Collector — observability, SSE subscribers, audit log, Prometheus.
+ *
+ * Counts partition a request exactly once: allowed, blocked, or banned.
  */
+
+import { maskIdentity } from "./identity";
+import type { LimiterDecision } from "./types";
 
 export interface EndpointStats {
   total: number;
   allowed: number;
   blocked: number;
+  banned: number;
 }
 
 export interface AuditEntry {
@@ -28,7 +34,7 @@ export interface MetricsSnapshot {
     timestamp: number;
     ip: string;
     endpoint: string;
-    status: number;
+    status: number | null;
     remaining: number;
   }>;
   auditLog: AuditEntry[];
@@ -63,36 +69,48 @@ export class MetricsCollector {
   private readonly HISTORY_WINDOW = 60_000;
   private readonly MAX_RECENT_REQUESTS = 50;
   private readonly MAX_AUDIT = 100;
+  private readonly MAX_HISTORY = 5_000;
 
   recordRequest(
     endpoint: string,
-    allowed: boolean,
-    ip: string,
-    status: number,
+    decision: LimiterDecision,
+    identity: string,
+    status: number | null,
     remaining: number,
-    extra?: { retryAfter?: number; reason?: AuditEntry["reason"] }
+    extra?: { retryAfter?: number }
   ): void {
     const now = Date.now();
+    const allowed = decision === "allowed";
+    const reason: AuditEntry["reason"] | null =
+      decision === "banned"
+        ? "ban"
+        : decision === "blocklist"
+          ? "blocklist"
+          : decision === "rate_limited"
+            ? "rate_limit"
+            : null;
 
     this.totalRequests++;
-    if (allowed) this.allowedRequests++;
+    if (decision === "allowed") this.allowedRequests++;
+    else if (decision === "banned") this.bannedRequests++;
     else this.blockedRequests++;
-    if (extra?.reason === "ban") this.bannedRequests++;
 
     if (!this.endpointStats.has(endpoint)) {
-      this.endpointStats.set(endpoint, { total: 0, allowed: 0, blocked: 0 });
+      this.endpointStats.set(endpoint, { total: 0, allowed: 0, blocked: 0, banned: 0 });
     }
     const stats = this.endpointStats.get(endpoint)!;
     stats.total++;
-    if (allowed) stats.allowed++;
+    if (decision === "allowed") stats.allowed++;
+    else if (decision === "banned") stats.banned++;
     else stats.blocked++;
 
-    this.activeIPsSet.set(ip, { ip, lastSeen: now });
+    const masked = maskIdentity(identity);
+    this.activeIPsSet.set(identity, { ip: masked, lastSeen: now });
     this.requestHistory.push({ timestamp: now, endpoint, allowed });
 
     this.recentRequests.unshift({
       timestamp: now,
-      ip: ip.length > 14 ? `${ip.slice(0, 12)}…` : ip,
+      ip: masked,
       endpoint,
       status,
       remaining,
@@ -101,13 +119,13 @@ export class MetricsCollector {
       this.recentRequests.pop();
     }
 
-    if (!allowed) {
+    if (reason) {
       this.auditLog.unshift({
         timestamp: now,
-        identity: ip.length > 14 ? `${ip.slice(0, 12)}…` : ip,
+        identity: masked,
         endpoint,
         retryAfter: extra?.retryAfter ?? 0,
-        reason: extra?.reason ?? "rate_limit",
+        reason,
       });
       if (this.auditLog.length > this.MAX_AUDIT) this.auditLog.pop();
     }
@@ -159,6 +177,9 @@ export class MetricsCollector {
       lines.push(
         `rate_limit_requests_per_endpoint_total{endpoint="${ep}",result="blocked"} ${stats.blocked}`
       );
+      lines.push(
+        `rate_limit_requests_per_endpoint_total{endpoint="${ep}",result="banned"} ${stats.banned}`
+      );
     }
     lines.push("# EOF");
     return lines.join("\n") + "\n";
@@ -207,6 +228,9 @@ export class MetricsCollector {
     this.requestHistory = this.requestHistory.filter(
       (r) => r.timestamp >= windowStart
     );
+    if (this.requestHistory.length > this.MAX_HISTORY) {
+      this.requestHistory.splice(0, this.requestHistory.length - this.MAX_HISTORY);
+    }
   }
 }
 

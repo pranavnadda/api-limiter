@@ -1,16 +1,33 @@
 /**
  * Rate Limiter Core — dispatches fixed-window, token-bucket, and sliding-window.
  * Multi-window configs AND together: every window must allow the request.
+ * A deny consumes none of the windows.
  */
 
-import { extractClientIP, identityKey } from "./identity";
-import { RateLimitStore, RateLimitConfig, RateLimitResult } from "./types";
+import {
+  ClientIpRequiredError,
+  extractClientIP,
+  resolveIdentity,
+} from "./identity";
+import { RateLimitStore, RateLimitConfig, RateLimitResult, WindowCheck } from "./types";
 
 export interface RateLimitRequestContext {
   url: string;
   method: string;
   headers: Headers;
-  ip?: string;
+  /** Already-extracted trusted IP. Null means the IP could not be determined. */
+  ip?: string | null;
+  issuedKeys?: readonly string[];
+}
+
+export function rateLimitWindowKey(
+  baseKey: string,
+  index: number,
+  windowMs: number,
+  windowCount: number
+): string {
+  if (windowCount === 1) return baseKey;
+  return `${baseKey}:w${index}:${windowMs}`;
 }
 
 export class RateLimiter {
@@ -21,31 +38,35 @@ export class RateLimiter {
     config: RateLimitConfig,
     keyPrefix?: string
   ): Promise<RateLimitResult> {
-    const ip = req.ip || extractClientIP(req.headers);
-    const id = identityKey(req.headers, ip);
+    const trustedIp = req.ip === undefined ? extractClientIP(req.headers) : req.ip;
+    const identity = resolveIdentity(req.headers, trustedIp, req.issuedKeys ?? []);
+    if (!identity) throw new ClientIpRequiredError();
+
     const endpoint =
       keyPrefix || req.url.split("?")[0].split("/").pop() || "default";
-    const baseKey = `${endpoint}:${id}`;
+    const baseKey = `${endpoint}:${identity}`;
 
     const windows = [
       { windowMs: config.windowMs, limit: config.limit },
       ...(config.windows ?? []),
     ];
 
-    let success = true;
+    const checks: WindowCheck[] = windows.map((window, index) => ({
+      key: rateLimitWindowKey(baseKey, index, window.windowMs, windows.length),
+      config: {
+        ...config,
+        windowMs: window.windowMs,
+        limit: window.limit,
+      },
+    }));
+
+    const commit = await this.store.consumeAll(checks);
+
     let remaining = Number.POSITIVE_INFINITY;
     let resetTime = 0;
     let limit = config.limit;
 
-    for (const window of windows) {
-      const key =
-        windows.length > 1 ? `${baseKey}:w${window.windowMs}` : baseKey;
-      const result = await this.store.consume(key, {
-        ...config,
-        windowMs: window.windowMs,
-        limit: window.limit,
-      });
-      if (!result.allowed) success = false;
+    for (const result of commit.results) {
       if (result.remaining < remaining) {
         remaining = result.remaining;
         resetTime = result.resetTime;
@@ -56,7 +77,7 @@ export class RateLimiter {
     }
 
     return {
-      success,
+      success: commit.allowed,
       limit,
       remaining: Number.isFinite(remaining) ? remaining : 0,
       resetTime,

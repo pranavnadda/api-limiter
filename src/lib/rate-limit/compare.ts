@@ -6,6 +6,26 @@
 import { MemoryStore } from "./memory-store";
 import { RateLimitAlgorithm, RateLimitConfig } from "./types";
 
+export class CompareInputError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CompareInputError";
+  }
+}
+
+const RANGES = {
+  limit: [1, 10_000],
+  windowMs: [100, 86_400_000],
+  burst: [1, 100],
+} as const;
+
+function requireRange(name: keyof typeof RANGES, value: number): void {
+  const [min, max] = RANGES[name];
+  if (!Number.isFinite(value) || value < min || value > max) {
+    throw new CompareInputError(`${name} must be between ${min} and ${max}`);
+  }
+}
+
 export interface ComparePoint {
   index: number;
   t: number;
@@ -25,6 +45,10 @@ export async function compareAlgorithms(opts: {
   windowMs?: number;
   burst?: number;
 }): Promise<CompareResult> {
+  if (opts.limit !== undefined) requireRange("limit", opts.limit);
+  if (opts.windowMs !== undefined) requireRange("windowMs", opts.windowMs);
+  if (opts.burst !== undefined) requireRange("burst", opts.burst);
+
   const limit = opts.limit ?? 10;
   const windowMs = opts.windowMs ?? 60_000;
   const burst = opts.burst ?? 20;

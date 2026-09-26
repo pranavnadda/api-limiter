@@ -1,9 +1,8 @@
 /**
  * Contact Endpoint — Portfolio Contact Form
  *
- * WHY: This mimics a real contact form submission. Rate limiting
- * here prevents spam bots from flooding your email or database.
- * Low limit (3 per 10 minutes per IP) is realistic.
+ * The limiter runs in middleware before this handler, so invalid bodies
+ * still consume a token. Validation here only shapes the response.
  */
 
 import { ok, fail } from "@/lib/api-response";
@@ -17,9 +16,7 @@ interface ContactFormData {
 
 /**
  * Validate contact form input.
- * WHY: Reject garbage cheaply—before hitting rate limiter or
- * downstream processing. Prevents wasted rate limit quota
- * on malformed requests.
+ * Middleware has already counted the request by the time this runs.
  */
 function validateContact(data: Partial<ContactFormData>): string[] {
   const errors: string[] = [];

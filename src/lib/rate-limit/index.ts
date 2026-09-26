@@ -10,12 +10,18 @@ export { banStore } from "./ban-store";
 export { MetricsCollector, metrics } from "./metrics";
 export { tryCreateRedisStore } from "./redis-store";
 export { compareAlgorithms } from "./compare";
-export { extractClientIP, extractApiKey, identityKey } from "./identity";
+export {
+  extractClientIP,
+  extractApiKey,
+  resolveIdentity,
+  maskIdentity,
+} from "./identity";
 export type {
   RateLimitConfig,
   RateLimitResult,
   RateLimitStore,
   RateLimitAlgorithm,
   ConsumeResult,
+  LimiterDecision,
 } from "./types";
 export type { MetricsSnapshot, EndpointStats, AuditEntry } from "./metrics";

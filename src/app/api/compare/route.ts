@@ -1,5 +1,5 @@
 import { ok, fail } from "@/lib/api-response";
-import { compareAlgorithms } from "@/lib/rate-limit/compare";
+import { CompareInputError, compareAlgorithms } from "@/lib/rate-limit/compare";
 
 export async function POST(req: Request) {
   let body: { limit?: number; windowMs?: number; burst?: number } = {};
@@ -16,6 +16,9 @@ export async function POST(req: Request) {
     });
     return ok(result);
   } catch (err) {
+    if (err instanceof CompareInputError) {
+      return fail("VALIDATION_ERROR", err.message, 400);
+    }
     return fail(
       "COMPARE_FAILED",
       err instanceof Error ? err.message : "Compare failed",

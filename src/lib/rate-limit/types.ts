@@ -3,6 +3,8 @@ export type RateLimitAlgorithm =
   | "token-bucket"
   | "sliding-window";
 
+export type LimiterDecision = "allowed" | "rate_limited" | "banned" | "blocklist";
+
 export interface WindowLimit {
   windowMs: number;
   limit: number;
@@ -33,6 +35,16 @@ export interface RateLimitConfig {
   windows?: WindowLimit[];
 }
 
+export interface WindowCheck {
+  key: string;
+  config: RateLimitConfig;
+}
+
+export interface CommitResult {
+  allowed: boolean;
+  results: ConsumeResult[];
+}
+
 export interface RateLimitOptions extends RateLimitConfig {
   keyPrefix?: string;
   generateKey?: (request: Request) => string;
@@ -43,6 +55,13 @@ export interface RateLimitStore {
     key: string,
     windowMs: number
   ): Promise<{ count: number; resetTime: number }>;
+  /** Non-mutating preview of one window. */
+  probe(key: string, config: RateLimitConfig): Promise<ConsumeResult>;
   consume(key: string, config: RateLimitConfig): Promise<ConsumeResult>;
+  /**
+   * If every window would allow, consume all of them.
+   * If any would deny, consume none.
+   */
+  consumeAll(checks: WindowCheck[]): Promise<CommitResult>;
   reset(key: string): Promise<void>;
 }

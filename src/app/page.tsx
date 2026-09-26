@@ -37,7 +37,10 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [live, setLive] = useState(false);
   const [chartData, setChartData] = useState<Array<{ time: string; rps: number }>>([]);
-  const [adminKey, setAdminKey] = useState('demo-reset-key');
+  const [adminKey, setAdminKey] = useState('');
+  const [activeKey, setActiveKey] = useState('');
+  const [hydrated, setHydrated] = useState(false);
+  const [sessionNonce, setSessionNonce] = useState(0);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [simLog, setSimLog] = useState<string[]>([]);
@@ -54,7 +57,14 @@ export default function Dashboard() {
 
   useEffect(() => {
     const stored = localStorage.getItem(ADMIN_STORAGE);
-    if (stored) setAdminKey(stored);
+    if (stored === 'demo-reset-key') {
+      localStorage.removeItem(ADMIN_STORAGE);
+      setError('The old demo password is not accepted. Type the value of ADMIN_RESET_KEY.');
+    } else if (stored) {
+      setAdminKey(stored);
+      setActiveKey(stored);
+    }
+    setHydrated(true);
   }, []);
 
   const applyMetrics = useCallback((data: MetricsSnapshot) => {
@@ -68,12 +78,20 @@ export default function Dashboard() {
   }, []);
 
   useEffect(() => {
+    if (!hydrated) return;
+    if (!activeKey) {
+      setLoading(false);
+      setMetrics(null);
+      setError((prev) => prev ?? 'Enter the admin key from ADMIN_RESET_KEY.');
+      return;
+    }
+
     let cancelled = false;
     let source: EventSource | null = null;
     let poll: ReturnType<typeof setInterval> | undefined;
 
     const loadConfig = async () => {
-      const res = await fetch('/api/config');
+      const res = await fetch('/api/config', { credentials: 'include' });
       if (!res.ok) throw new Error(`Config ${res.status}`);
       const payload = unwrap<ConfigSnapshot>(await res.json());
       if (!cancelled) {
@@ -86,7 +104,7 @@ export default function Dashboard() {
     };
 
     const pollMetrics = async () => {
-      const res = await fetch('/api/metrics');
+      const res = await fetch('/api/metrics', { credentials: 'include' });
       if (!res.ok) throw new Error(`Metrics ${res.status}`);
       const payload = unwrap<MetricsSnapshot>(await res.json());
       if (!cancelled) applyMetrics(payload);
@@ -94,6 +112,13 @@ export default function Dashboard() {
 
     const start = async () => {
       try {
+        const session = await fetch('/api/admin/session', {
+          method: 'POST',
+          headers: { 'X-Admin-Reset': activeKey },
+          credentials: 'include',
+        });
+        if (!session.ok) throw new Error('Admin key rejected');
+        localStorage.setItem(ADMIN_STORAGE, activeKey);
         await Promise.all([loadConfig(), pollMetrics()]);
         source = new EventSource('/api/metrics/stream');
         source.onmessage = (ev) => {
@@ -124,7 +149,7 @@ export default function Dashboard() {
       source?.close();
       if (poll) clearInterval(poll);
     };
-  }, [applyMetrics]);
+  }, [applyMetrics, hydrated, activeKey, sessionNonce]);
 
   const adminHeaders = useMemo(
     () => ({ 'Content-Type': 'application/json', 'X-Admin-Reset': adminKey }),
@@ -251,7 +276,14 @@ export default function Dashboard() {
     setBusy(null);
   }
 
-  if (loading) {
+  function connectAdmin() {
+    setError(null);
+    setLoading(true);
+    setActiveKey(adminKey);
+    setSessionNonce((n) => n + 1);
+  }
+
+  if (!hydrated || loading) {
     return (
       <main className="app-shell">
         <h1>Rate limiter</h1>
@@ -267,8 +299,22 @@ export default function Dashboard() {
       <main className="app-shell">
         <h1>Rate limiter</h1>
         <div className="banner">
-          Metrics endpoint unreachable: {error}. Start the app with npm run dev.
+          {error ?? 'Metrics are unavailable.'} Set ADMIN_RESET_KEY in .env.local, restart the
+          dev server, and type that value here. For local fake IPs, also set
+          ALLOW_UNTRUSTED_FORWARDED=1.
         </div>
+        <label className="field" style={{ maxWidth: 320, marginTop: 16 }}>
+          <span>Admin key</span>
+          <input
+            type="password"
+            value={adminKey}
+            onChange={(e) => setAdminKey(e.target.value)}
+            autoComplete="off"
+          />
+        </label>
+        <button className="btn btn-primary" style={{ marginTop: 12 }} onClick={connectAdmin}>
+          Connect
+        </button>
       </main>
     );
   }
@@ -280,6 +326,7 @@ export default function Dashboard() {
     name,
     blocked: stats.blocked,
     allowed: stats.allowed,
+    banned: stats.banned,
   }));
   const compareChart = compare
     ? compare.series['fixed-window'].map((point, i) => ({
@@ -392,7 +439,7 @@ export default function Dashboard() {
               />
             </label>
             <label className="field">
-              <span>Fake IP (x-forwarded-for)</span>
+              <span>Fake IP (x-forwarded-for, dev flag)</span>
               <input
                 value={sim.ip}
                 onChange={(e) => setSim({ ...sim, ip: e.target.value })}
@@ -471,6 +518,7 @@ export default function Dashboard() {
                   <Tooltip contentStyle={{ background: '#1a1f16', border: '1px solid #2c3326' }} />
                   <Bar dataKey="allowed" stackId="a" fill="#7ecf9a" />
                   <Bar dataKey="blocked" stackId="a" fill="#e25b3a" />
+                  <Bar dataKey="banned" stackId="a" fill="#e0b05a" />
                 </BarChart>
               </ResponsiveContainer>
             ) : (
@@ -507,7 +555,9 @@ export default function Dashboard() {
                       <td>
                         <code>{row.endpoint}</code>
                       </td>
-                      <td className={row.status === 200 ? 'status-ok' : 'status-bad'}>{row.status}</td>
+                      <td className={row.status === 403 || row.status === 429 ? 'status-bad' : 'status-ok'}>
+                        {row.status ?? '—'}
+                      </td>
                       <td>{row.remaining}</td>
                     </tr>
                   ))}

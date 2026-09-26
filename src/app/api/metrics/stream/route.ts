@@ -1,8 +1,13 @@
+import { fail } from "@/lib/api-response";
+import { isAuthorizedAdmin } from "@/lib/admin-auth";
 import { metrics } from "@/lib/rate-limit/metrics";
 
 export const runtime = "nodejs";
 
-export async function GET() {
+export async function GET(req: Request) {
+  if (!isAuthorizedAdmin(req)) {
+    return fail("UNAUTHORIZED", "Invalid or missing admin credentials", 401);
+  }
   const encoder = new TextEncoder();
   let unsubscribe: (() => void) | undefined;
 

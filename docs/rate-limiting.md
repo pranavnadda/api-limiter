@@ -1,43 +1,52 @@
 /**
- * README — Rate Limiting Documentation
+ * Rate limiting — current behavior
  *
- * WHY: This explains how the rate limiter works, how to test it,
- * and how to upgrade to Redis for production use.
+ * The sections below the "Historical notes" heading describe earlier milestones.
+ * Where they disagree with this section, this section is the one that matches the code.
  */
+
+## Current behavior
+
+- **Algorithms:** fixed-window, token-bucket, and sliding-window. Extra windows are AND-ed: if any window would deny, none of them are consumed.
+- **Primary window:** `60_000` ms is one minute. Contact is `600_000` ms (10 minutes) at 3 requests.
+- **Identity:** an API key counts only when it is in `API_KEYS`. Otherwise the key is the trusted client IP. `TRUSTED_PROXY_HOPS` reads that many addresses from the right of `x-forwarded-for`. Missing identity returns `400 CLIENT_IP_REQUIRED` and does not share an `unknown` bucket.
+- **Redis:** fixed windows commit with `INCR` and `PEXPIRE` inside one `EVAL`. Token bucket, sliding window, and multi-window checks are the same script, so a deny writes nothing. Bans and live config are stored in Redis when Upstash is configured. A store error returns `503`, not the next handler.
+- **Reset header:** `X-RateLimit-Reset` is epoch milliseconds. `Retry-After` is delta seconds. The `429` body puts `retryAfter` on `error.details`.
+- **Admin:** `ADMIN_RESET_KEY` is required. There is no default key. Reads of config, metrics, SSE, and Prometheus use the same check. The dashboard posts the key once and then sends an httpOnly cookie.
+
+## Historical notes
 
 ## How It Works
 
 ### Core Algorithm
 - **Fixed-window counter**: Each request increments a counter for its window.
-- **Window**: 60,000ms (10 minutes) by default, configurable per endpoint.
-- **Per-IP tracking**: Uses x-forwarded-for header to isolate clients.
+- **Window**: 60,000 ms is one minute. Per-endpoint values live in `src/lib/rate-limit/config.ts`.
+- **Identity**: Issued API key, otherwise the trusted proxy IP. See [`security-IP-spoof.md`](./security-IP-spoof.md).
 
 ### Rate Limit Headers
 Every response includes:
 - `X-RateLimit-Limit`: Max requests allowed in the window
 - `X-RateLimit-Remaining`: Requests remaining in the current window
-- `X-RateLimit-Reset`: Unix timestamp when window resets
+- `X-RateLimit-Reset`: Epoch milliseconds when the window resets
 - `Retry-After`: Seconds to wait (only on 429 responses)
 
 ### Edge Cases
 
-**1. x-forwarded-for Trust**
-- Only trust this header if your server is behind a proxy (Vercel, Cloudflare, etc.)
-- For raw self-hosted servers, consider using `req.ip` (Next.js 14+) or require API keys
-- See [`security-IP-spoof.md`](./security-IP-spoof.md) for the full design note (added in Phase 3 audit, 2026-08-28)
+**1. Trusted proxy hops**
+- `TRUSTED_PROXY_HOPS=0` ignores forwarding headers.
+- A positive hop count takes that many addresses from the right of `x-forwarded-for`.
+- See [`security-IP-spoof.md`](./security-IP-spoof.md).
 
-**2. Memory Leak Prevention**
-- Expired entries are lazily cleaned during increment()
-- Periodic cleanup runs every 5 minutes to remove all expired buckets
+**2. Memory cleanup**
+- Fixed-window, token-bucket, and sliding-window entries are swept on a timer, not on the request path.
+- Token buckets expire after `max(windowMs * 2, 60s)` of idle time.
 
-**3. Clock Skew**
-- Uses Date.now() consistently — no external time sources
-- All calculations are based on the same clock
+**3. Clock**
+- Uses `Date.now()` consistently.
 
-**3. Concurrent Requests**
-- JavaScript is single-threaded, so requests execute sequentially
-- No true race conditions in the Map-based store
-- Second request always sees the latest state
+**4. Concurrent requests**
+- One Node process runs JavaScript turns one at a time, and `consumeAll` does not yield between the check and the commit.
+- Across processes, Redis `EVAL` runs `INCR` / `PEXPIRE` (and the token and sliding updates) as one script so two instances cannot both read the same count and both allow.
 
 ### Testing the Rate Limiter
 

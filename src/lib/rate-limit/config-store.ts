@@ -4,7 +4,12 @@
  */
 
 import { defaultConfig, endpointConfig } from "./config";
+import { parseIssuedKeys } from "./identity";
+import { getRedis, type RedisLike } from "./redis-client";
 import { RateLimitAlgorithm, RateLimitConfig, WindowLimit } from "./types";
+
+const CONFIG_KEY = "rl:config";
+const CONFIG_CACHE_MS = 1000;
 
 export interface LiveEndpointConfig extends RateLimitConfig {
   algorithm: RateLimitAlgorithm;
@@ -15,6 +20,7 @@ export interface ConfigSnapshot {
   defaultConfig: RateLimitConfig;
   allowlist: string[];
   blocklist: string[];
+  issuedKeys: string[];
   ban: {
     threshold: number;
     strikeWindowMs: number;
@@ -38,6 +44,10 @@ export class ConfigStore {
   );
   allowlist: string[] = [];
   blocklist: string[] = [];
+  issuedKeys: string[] = parseIssuedKeys(process.env.API_KEYS);
+  private redisChecked = false;
+  private redis: RedisLike | null = null;
+  private loadedAt = 0;
   ban = {
     threshold: 5,
     strikeWindowMs: 60_000,
@@ -54,6 +64,7 @@ export class ConfigStore {
       defaultConfig: { ...defaultConfig },
       allowlist: [...this.allowlist],
       blocklist: [...this.blocklist],
+      issuedKeys: [...this.issuedKeys],
       ban: { ...this.ban },
     };
   }
@@ -107,7 +118,63 @@ export class ConfigStore {
   }
 
   setBan(patch: Partial<ConfigStore["ban"]>): void {
-    this.ban = { ...this.ban, ...patch };
+    const next = { ...this.ban, ...patch };
+    if (!Number.isFinite(next.threshold) || next.threshold < 1) {
+      throw new Error("threshold must be a finite number >= 1");
+    }
+    if (!Number.isFinite(next.strikeWindowMs) || next.strikeWindowMs < 100) {
+      throw new Error("strikeWindowMs must be a finite number >= 100");
+    }
+    if (!Number.isFinite(next.banMs) || next.banMs < 1000) {
+      throw new Error("banMs must be a finite number >= 1000");
+    }
+    this.ban = {
+      threshold: Math.floor(next.threshold),
+      strikeWindowMs: Math.floor(next.strikeWindowMs),
+      banMs: Math.floor(next.banMs),
+    };
+  }
+
+  async ensureFresh(): Promise<void> {
+    const redis = this.client();
+    if (!redis) return;
+    const now = Date.now();
+    if (this.loadedAt && now - this.loadedAt < CONFIG_CACHE_MS) return;
+    const raw = await redis.get(CONFIG_KEY);
+    if (!raw) {
+      await redis.set(CONFIG_KEY, JSON.stringify(this.list()));
+    } else {
+      this.applySnapshot(JSON.parse(raw) as ConfigSnapshot);
+    }
+    this.loadedAt = Date.now();
+  }
+
+  async persist(): Promise<void> {
+    const redis = this.client();
+    if (!redis) return;
+    await redis.set(CONFIG_KEY, JSON.stringify(this.list()));
+    this.loadedAt = Date.now();
+  }
+
+  private client(): RedisLike | null {
+    if (!this.redisChecked) {
+      this.redis = getRedis();
+      this.redisChecked = true;
+    }
+    return this.redis;
+  }
+
+  private applySnapshot(snapshot: ConfigSnapshot): void {
+    if (!snapshot || typeof snapshot !== "object") {
+      throw new Error("Invalid limiter config snapshot");
+    }
+    this.endpoints = Object.fromEntries(
+      Object.entries(snapshot.endpoints ?? {}).map(([name, cfg]) => [name, toLive(cfg)])
+    );
+    this.allowlist = [...(snapshot.allowlist ?? [])];
+    this.blocklist = [...(snapshot.blocklist ?? [])];
+    this.issuedKeys = [...(snapshot.issuedKeys ?? this.issuedKeys)];
+    this.setBan(snapshot.ban ?? this.ban);
   }
 
   isAllowed(identity: string, ip: string): boolean {

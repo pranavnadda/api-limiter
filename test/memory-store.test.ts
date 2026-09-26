@@ -1,9 +1,14 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
 import { MemoryStore } from "@/lib/rate-limit/memory-store";
-import { RateLimiter } from "@/lib/rate-limit/limiter";
+import { RateLimiter, rateLimitWindowKey } from "@/lib/rate-limit/limiter";
 import { BanStore } from "@/lib/rate-limit/ban-store";
 import { ConfigStore } from "@/lib/rate-limit/config-store";
-import { identityKey, extractApiKey, extractClientIP } from "@/lib/rate-limit/identity";
+import {
+  resolveIdentity,
+  extractApiKey,
+  extractClientIP,
+  maskIdentity,
+} from "@/lib/rate-limit/identity";
 import { compareAlgorithms } from "@/lib/rate-limit/compare";
 import { MetricsCollector } from "@/lib/rate-limit/metrics";
 
@@ -76,16 +81,18 @@ describe("MemoryStore", () => {
 });
 
 describe("RateLimiter", () => {
-  it("uses API key identity over IP", async () => {
+  it("uses an issued API key and ignores unissued keys", async () => {
     const store = new MemoryStore();
     const limiter = new RateLimiter(store);
     const cfg = { windowMs: 60_000, limit: 1 };
+    const issuedKeys = ["alpha"];
     const first = await limiter.check(
       {
         url: "/api/ping",
         method: "GET",
         headers: headers({ "x-api-key": "alpha", "x-forwarded-for": "1.1.1.1" }),
         ip: "1.1.1.1",
+        issuedKeys,
       },
       cfg,
       "ping"
@@ -96,26 +103,40 @@ describe("RateLimiter", () => {
         method: "GET",
         headers: headers({ "x-api-key": "alpha", "x-forwarded-for": "9.9.9.9" }),
         ip: "9.9.9.9",
+        issuedKeys,
       },
       cfg,
       "ping"
     );
-    const otherKey = await limiter.check(
+    const unissuedSharesIp = await limiter.check(
       {
         url: "/api/ping",
         method: "GET",
         headers: headers({ "x-api-key": "beta" }),
         ip: "1.1.1.1",
+        issuedKeys,
+      },
+      cfg,
+      "ping"
+    );
+    const sameIpAgain = await limiter.check(
+      {
+        url: "/api/ping",
+        method: "GET",
+        headers: headers({ "x-api-key": "gamma" }),
+        ip: "1.1.1.1",
+        issuedKeys,
       },
       cfg,
       "ping"
     );
     expect(first.success).toBe(true);
     expect(secondSameKey.success).toBe(false);
-    expect(otherKey.success).toBe(true);
+    expect(unissuedSharesIp.success).toBe(true);
+    expect(sameIpAgain.success).toBe(false);
   });
 
-  it("ANDs multi-window limits", async () => {
+  it("ANDs multi-window limits without consuming the sibling window on deny", async () => {
     const store = new MemoryStore();
     const limiter = new RateLimiter(store);
     const cfg = {
@@ -132,18 +153,53 @@ describe("RateLimiter", () => {
     expect((await limiter.check(req, cfg, "ping")).success).toBe(true);
     expect((await limiter.check(req, cfg, "ping")).success).toBe(true);
     expect((await limiter.check(req, cfg, "ping")).success).toBe(false);
+    const base = "ping:ip:2.2.2.2";
+    expect(store.getCount(rateLimitWindowKey(base, 0, 1000, 2))).toBe(2);
+    expect(store.getCount(rateLimitWindowKey(base, 1, 10_000, 2))).toBe(2);
   });
 });
 
 describe("identity", () => {
-  it("prefers x-api-key, then bearer, then IP", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("prefers an issued key, then a trusted IP", () => {
     expect(extractApiKey(headers({ "x-api-key": "abc" }))).toBe("abc");
     expect(extractApiKey(headers({ authorization: "Bearer tok" }))).toBe("tok");
-    expect(extractClientIP(headers({ "x-forwarded-for": "1.2.3.4, 10.0.0.1" }))).toBe(
-      "1.2.3.4"
+    expect(resolveIdentity(headers({ "x-api-key": "abc" }), "1.2.3.4", ["abc"])).toBe("key:abc");
+    expect(resolveIdentity(headers({ "x-api-key": "nope" }), "1.2.3.4", ["abc"])).toBe(
+      "ip:1.2.3.4"
     );
-    expect(identityKey(headers({ "x-api-key": "abc" }), "1.2.3.4")).toBe("key:abc");
-    expect(identityKey(headers(), "1.2.3.4")).toBe("ip:1.2.3.4");
+    expect(resolveIdentity(headers(), null, [])).toBeNull();
+  });
+
+  it("takes trusted hops from the right and ignores forwarding when hops are 0", () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("ALLOW_UNTRUSTED_FORWARDED", "1");
+    vi.stubEnv("TRUSTED_PROXY_HOPS", "0");
+    expect(
+      extractClientIP(headers({ "x-forwarded-for": "1.2.3.4, 10.0.0.1" }))
+    ).toBeNull();
+
+    vi.stubEnv("TRUSTED_PROXY_HOPS", "1");
+    expect(
+      extractClientIP(headers({ "x-forwarded-for": "1.2.3.4, 10.0.0.1" }))
+    ).toBe("10.0.0.1");
+  });
+
+  it("honors the leftmost forwarded IP only for the development simulator flag", () => {
+    vi.stubEnv("NODE_ENV", "test");
+    vi.stubEnv("ALLOW_UNTRUSTED_FORWARDED", "1");
+    expect(
+      extractClientIP(headers({ "x-forwarded-for": "1.2.3.4, 10.0.0.1" }))
+    ).toBe("1.2.3.4");
+    expect(extractClientIP(headers())).toBe("127.0.0.1");
+  });
+
+  it("masks short and long identities the same way", () => {
+    expect(maskIdentity("ip:1.2.3.4")).toBe("ip:1…");
+    expect(maskIdentity("key:super-secret-token")).toBe("key:…");
   });
 });
 
@@ -167,6 +223,13 @@ describe("ConfigStore", () => {
     expect(next.algorithm).toBe("token-bucket");
     expect(store.get("ping").limit).toBe(4);
   });
+
+  it("rejects non-finite and non-positive ban settings", () => {
+    const store = new ConfigStore();
+    expect(() => store.setBan({ threshold: 0 })).toThrow(/threshold/);
+    expect(() => store.setBan({ threshold: Number.NaN })).toThrow(/threshold/);
+    expect(() => store.setBan({ banMs: 10 })).toThrow(/banMs/);
+  });
 });
 
 describe("compareAlgorithms", () => {
@@ -176,20 +239,60 @@ describe("compareAlgorithms", () => {
     expect(result.series["token-bucket"]).toHaveLength(8);
     expect(result.series["sliding-window"]).toHaveLength(8);
   });
+
+  it("rejects a burst above the cap", async () => {
+    await expect(compareAlgorithms({ burst: 101 })).rejects.toThrow(/burst/);
+  });
 });
 
 describe("MetricsCollector", () => {
-  it("records audit entries for blocked requests", () => {
+  it("records audit entries for blocked requests and does not double-count bans", () => {
     const m = new MetricsCollector();
-    m.recordRequest("ping", true, "ip:1", 200, 9);
-    m.recordRequest("ping", false, "ip:1", 429, 0, {
+    m.recordRequest("ping", "allowed", "ip:1.2.3.4", null, 9);
+    m.recordRequest("ping", "rate_limited", "ip:1.2.3.4", 429, 0, {
       retryAfter: 12,
-      reason: "rate_limit",
     });
+    m.recordRequest("ping", "banned", "ip:1.2.3.4", 429, 0, { retryAfter: 30 });
     const snap = m.getSnapshot();
-    expect(snap.total).toBe(2);
+    expect(snap.total).toBe(3);
+    expect(snap.allowed).toBe(1);
     expect(snap.blocked).toBe(1);
-    expect(snap.auditLog[0]?.reason).toBe("rate_limit");
-    expect(m.toPrometheus()).toContain("rate_limit_requests_total");
+    expect(snap.banned).toBe(1);
+    expect(snap.allowed + snap.blocked + snap.banned).toBe(snap.total);
+    expect(snap.auditLog[0]?.reason).toBe("ban");
+    expect(snap.auditLog[0]?.identity).toBe("ip:1…");
+    expect(snap.recentRequests[2]?.status).toBeNull();
+    expect(m.toPrometheus()).toContain('result="banned"');
+  });
+
+  it("caps request history by count", () => {
+    const m = new MetricsCollector();
+    for (let i = 0; i < 5_050; i++) {
+      m.recordRequest("ping", "allowed", "ip:1.2.3.4", null, 1);
+    }
+    const internal = m as unknown as { requestHistory: unknown[] };
+    expect(internal.requestHistory.length).toBeLessThanOrEqual(5_000);
+  });
+});
+
+describe("token bucket eviction", () => {
+  it("drops idle token buckets and expired sliding buckets", () => {
+    let t = 0;
+    const store = new MemoryStore(() => t);
+    store.consume("tb", {
+      windowMs: 1_000,
+      limit: 2,
+      algorithm: "token-bucket",
+      refillRate: 1,
+    });
+    store.consume("sw", {
+      windowMs: 1_000,
+      limit: 2,
+      algorithm: "sliding-window",
+    });
+    t = 60_001;
+    expect(store.cleanupExpired()).toBeGreaterThanOrEqual(1);
+    expect(store.getCount("tb")).toBeUndefined();
+    expect(store.getCount("sw")).toBeUndefined();
   });
 });

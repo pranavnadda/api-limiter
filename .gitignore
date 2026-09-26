@@ -25,7 +25,6 @@ yarn-error.log*
 
 # TypeScript
 *.tsbuildinfo
-next-env.d.ts
 
 # IDE
 .vscode/
@@ -37,8 +36,6 @@ next-env.d.ts
 .claude/
 agent/
 
-# Internal documentation / notes
-*.md
-!README.md
-
+# Local notes. Project docs are tracked.
+errors.md
 *.txt

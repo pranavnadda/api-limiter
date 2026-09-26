@@ -3,7 +3,11 @@ import { isAuthorizedAdmin } from "@/lib/admin-auth";
 import { configStore } from "@/lib/rate-limit/config-store";
 import type { RateLimitAlgorithm, WindowLimit } from "@/lib/rate-limit/types";
 
-export async function GET() {
+export async function GET(req: Request) {
+  if (!isAuthorizedAdmin(req)) {
+    return fail("UNAUTHORIZED", "Invalid or missing admin credentials", 401);
+  }
+  await configStore.ensureFresh();
   return ok(configStore.list());
 }
 
@@ -25,7 +29,7 @@ interface ConfigBody {
 
 export async function POST(req: Request) {
   if (!isAuthorizedAdmin(req)) {
-    return fail("UNAUTHORIZED", "Invalid or missing X-Admin-Reset header", 401);
+    return fail("UNAUTHORIZED", "Invalid or missing admin credentials", 401);
   }
 
   let body: ConfigBody;
@@ -51,11 +55,13 @@ export async function POST(req: Request) {
         windows: body.windows,
       });
     }
+    await configStore.persist();
     return ok(configStore.list());
   } catch (err) {
-    return fail(
-      "VALIDATION_ERROR",
-      err instanceof Error ? err.message : "Invalid config"
-    );
+    const message = err instanceof Error ? err.message : "Invalid config";
+    if (message.includes("must be")) {
+      return fail("VALIDATION_ERROR", message);
+    }
+    return fail("LIMITER_UNAVAILABLE", "Could not save limiter config.", 503);
   }
 }

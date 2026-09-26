@@ -1,40 +1,50 @@
 /**
- * Redis / Upstash store. Same consume() contract as MemoryStore.
- * Only constructed when UPSTASH_REDIS_REST_URL and TOKEN are set.
+ * Redis / Upstash store. consumeAll is one EVAL: INCR + PEXPIRE for fixed
+ * windows, and a single commit for token-bucket and sliding-window.
+ * A multi-window deny writes nothing.
  */
 
-import { Redis } from "@upstash/redis";
+import type { ConsumeSpec } from "./atomic";
+import { getRedis, type RedisLike } from "./redis-client";
+import { CONSUME_ALL_LUA } from "./scripts";
 import {
+  CommitResult,
   ConsumeResult,
   RateLimitConfig,
   RateLimitStore,
+  WindowCheck,
 } from "./types";
+import { tokenIdleTtlMs } from "./memory-store";
 
-interface FixedState {
-  kind: "fixed";
-  count: number;
-  resetTime: number;
+export function counterKey(algorithm: string, logicalKey: string): string {
+  return `rl:${algorithm}:${logicalKey}`;
 }
 
-interface TokenState {
-  kind: "token";
-  tokens: number;
-  lastRefill: number;
+function buildSpec(config: RateLimitConfig, now: number): ConsumeSpec {
+  const algorithm = config.algorithm ?? "fixed-window";
+  const windowMs = config.windowMs;
+  const windowStart = Math.floor(now / windowMs) * windowMs;
+  const resetTime = windowStart + windowMs;
+  const refillRate =
+    config.refillRate ?? config.limit / Math.max(0.001, windowMs / 1000);
+  return {
+    algorithm,
+    limit: config.limit,
+    windowMs,
+    refillRate,
+    ttlMs: Math.max(1, resetTime - now),
+    resetTime,
+    idleTtlMs: tokenIdleTtlMs(windowMs),
+  };
 }
 
-interface SlidingState {
-  kind: "sliding";
-  timestamps: number[];
+function parseCommit(raw: unknown): CommitResult {
+  const value = typeof raw === "string" ? JSON.parse(raw) : raw;
+  return value as CommitResult;
 }
-
-type State = FixedState | TokenState | SlidingState;
 
 export class RedisStore implements RateLimitStore {
-  private redis: Redis;
-
-  constructor(url: string, token: string) {
-    this.redis = new Redis({ url, token });
-  }
+  constructor(private readonly redis: RedisLike) {}
 
   async increment(
     key: string,
@@ -47,156 +57,46 @@ export class RedisStore implements RateLimitStore {
     return { count: result.count, resetTime: result.resetTime };
   }
 
+  async probe(key: string, config: RateLimitConfig): Promise<ConsumeResult> {
+    const commit = await this.evaluate([{ key, config }], true);
+    return commit.results[0];
+  }
+
   async consume(key: string, config: RateLimitConfig): Promise<ConsumeResult> {
-    const algorithm = config.algorithm ?? "fixed-window";
-    const redisKey = `rl:${algorithm}:${key}`;
-    if (algorithm === "token-bucket") {
-      return this.consumeToken(redisKey, config);
-    }
-    if (algorithm === "sliding-window") {
-      return this.consumeSliding(redisKey, config);
-    }
-    return this.consumeFixed(redisKey, config);
+    const commit = await this.consumeAll([{ key, config }]);
+    return commit.results[0];
   }
 
-  private async read(redisKey: string): Promise<State | null> {
-    const raw = await this.redis.get<State | string>(redisKey);
-    if (!raw) return null;
-    if (typeof raw === "string") {
-      try {
-        return JSON.parse(raw) as State;
-      } catch {
-        return null;
-      }
-    }
-    return raw;
-  }
-
-  private async write(redisKey: string, state: State, ttlMs: number): Promise<void> {
-    await this.redis.set(redisKey, state, { px: Math.max(1000, ttlMs) });
-  }
-
-  private async consumeFixed(
-    redisKey: string,
-    config: RateLimitConfig
-  ): Promise<ConsumeResult> {
-    const now = Date.now();
-    const windowMs = config.windowMs;
-    const limit = config.limit;
-    const windowStart = Math.floor(now / windowMs) * windowMs;
-    const resetTime = windowStart + windowMs;
-    const existing = await this.read(redisKey);
-    let count = 1;
-    let usedReset = resetTime;
-    if (existing && existing.kind === "fixed" && existing.resetTime > now) {
-      count = existing.count + 1;
-      usedReset = existing.resetTime;
-    }
-    await this.write(
-      redisKey,
-      { kind: "fixed", count, resetTime: usedReset },
-      usedReset - now
-    );
-    return {
-      allowed: count <= limit,
-      count,
-      remaining: Math.max(0, limit - count),
-      resetTime: usedReset,
-      limit,
-    };
-  }
-
-  private async consumeToken(
-    redisKey: string,
-    config: RateLimitConfig
-  ): Promise<ConsumeResult> {
-    const now = Date.now();
-    const capacity = config.limit;
-    const refillPerSec =
-      config.refillRate ?? capacity / Math.max(0.001, config.windowMs / 1000);
-    const existing = await this.read(redisKey);
-    let tokens = capacity;
-    let lastRefill = now;
-    if (existing && existing.kind === "token") {
-      const elapsedSec = Math.max(0, (now - existing.lastRefill) / 1000);
-      tokens = Math.min(capacity, existing.tokens + elapsedSec * refillPerSec);
-      lastRefill = now;
-    }
-    const allowed = tokens >= 1;
-    if (allowed) tokens -= 1;
-    const tokensUntilOne = allowed ? 0 : Math.max(0, 1 - tokens);
-    const msUntilToken =
-      refillPerSec > 0
-        ? Math.ceil((tokensUntilOne / refillPerSec) * 1000)
-        : config.windowMs;
-    const resetTime =
-      now + (allowed ? Math.ceil((1 / refillPerSec) * 1000) : msUntilToken);
-    await this.write(
-      redisKey,
-      { kind: "token", tokens, lastRefill },
-      Math.max(config.windowMs * 2, 60_000)
-    );
-    return {
-      allowed,
-      count: Math.ceil(capacity - tokens),
-      remaining: Math.max(0, Math.floor(tokens)),
-      resetTime,
-      limit: capacity,
-    };
-  }
-
-  private async consumeSliding(
-    redisKey: string,
-    config: RateLimitConfig
-  ): Promise<ConsumeResult> {
-    const now = Date.now();
-    const windowMs = config.windowMs;
-    const limit = config.limit;
-    const cutoff = now - windowMs;
-    const existing = await this.read(redisKey);
-    let timestamps =
-      existing && existing.kind === "sliding"
-        ? existing.timestamps.filter((t) => t > cutoff)
-        : [];
-    if (timestamps.length >= limit) {
-      const oldest = timestamps[0] ?? now;
-      await this.write(
-        redisKey,
-        { kind: "sliding", timestamps },
-        windowMs
-      );
-      return {
-        allowed: false,
-        count: timestamps.length,
-        remaining: 0,
-        resetTime: oldest + windowMs,
-        limit,
-      };
-    }
-    timestamps = [...timestamps, now];
-    const oldest = timestamps[0] ?? now;
-    await this.write(redisKey, { kind: "sliding", timestamps }, windowMs);
-    return {
-      allowed: true,
-      count: timestamps.length,
-      remaining: Math.max(0, limit - timestamps.length),
-      resetTime: oldest + windowMs,
-      limit,
-    };
+  async consumeAll(checks: WindowCheck[]): Promise<CommitResult> {
+    return this.evaluate(checks, false);
   }
 
   async reset(key: string): Promise<void> {
     await this.redis.del(
-      `rl:fixed-window:${key}`,
-      `rl:token-bucket:${key}`,
-      `rl:sliding-window:${key}`
+      counterKey("fixed-window", key),
+      counterKey("token-bucket", key),
+      counterKey("sliding-window", key)
     );
+  }
+
+  private async evaluate(checks: WindowCheck[], dry: boolean): Promise<CommitResult> {
+    if (checks.length === 0) return { allowed: true, results: [] };
+    const now = Date.now();
+    const keys = checks.map((check) =>
+      counterKey(check.config.algorithm ?? "fixed-window", check.key)
+    );
+    const specs = checks.map((check) => buildSpec(check.config, now));
+    const raw = await this.redis.eval(CONSUME_ALL_LUA, keys, [
+      String(now),
+      JSON.stringify(specs),
+      dry ? "1" : "0",
+    ]);
+    return parseCommit(raw);
   }
 }
 
 export function tryCreateRedisStore(): RedisStore | null {
-  const url = process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!url || !token) return null;
-  return new RedisStore(url, token);
+  const redis = getRedis();
+  if (!redis) return null;
+  return new RedisStore(redis);
 }
